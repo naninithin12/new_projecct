@@ -1,0 +1,10 @@
+torch
+nnumpy
+pandas
+streamlit
+torchvision
+pymupdf
+faiss-cpu
+transformers
+langchain
+sentence-transfromers
