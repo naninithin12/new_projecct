@@ -1,5 +1,5 @@
 torch
-nnumpy
+numpy
 pandas
 streamlit
 torchvision
@@ -7,4 +7,4 @@ pymupdf
 faiss-cpu
 transformers
 langchain
-sentence-transfromers
+sentence-transformers
