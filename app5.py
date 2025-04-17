@@ -1,5 +1,7 @@
-import streamlit as st
 import os
+os.environ["STREAMLIT_WATCHER_TYPE"] = "none"  # Fix async event loop error
+
+import streamlit as st
 import json
 import uuid
 from PIL import Image
@@ -12,6 +14,7 @@ import faiss
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+import hashlib
 
 # --- Constants ---
 USER_DATA_FILE = 'users.json'
@@ -19,7 +22,6 @@ UPLOAD_FOLDER = 'static/uploads'
 MODEL_PATH = 'vgg_model.pth'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# --- Categories and Recommendations ---
 food_categories = ["Fruits", "Grains", "Vegetables", "Proteins", "Dairy"]
 vitamin_recommendations = {
     "Fruits": {"deficiency": "Vitamin A", "recommendation": "Eat carrots, sweet potatoes, and spinach."},
@@ -38,15 +40,21 @@ transform = transforms.Compose([
 ])
 
 # --- Load Models ---
-model = models.vgg16(pretrained=True)
-model.classifier[6] = nn.Linear(model.classifier[6].in_features, len(food_categories))
-#model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
-model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu'), weights_only=True))
+@st.cache_resource
+def get_models():
+    vgg_model = models.vgg16(pretrained=True)
+    vgg_model.classifier[6] = nn.Linear(vgg_model.classifier[6].in_features, len(food_categories))
+    vgg_model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
+    vgg_model.eval()
 
-model.eval()
+    # ✅ Faster embedding model
+    embedding_model = SentenceTransformer('sentence-transformers/paraphrase-albert-small-v2')  # ~45MB
+    text_generator = pipeline("text-generation", model="tiiuae/falcon-rw-1b", device=0)  # If you have a small GPU
 
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-generator = pipeline("text-generation", model="EleutherAI/gpt-neo-1.3B")
+
+    return vgg_model, embedding_model, text_generator
+
+model, embedding_model, generator = get_models()
 
 # --- Session State ---
 if 'logged_in' not in st.session_state:
@@ -120,15 +128,24 @@ def food_dashboard():
 
 # --- Document QA System ---
 def extract_text_from_pdf(pdf_file):
-    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
-    return "\n".join([page.get_text() for page in doc])
+    try:
+        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+        return "\n".join([page.get_text() for page in doc])
+    except Exception as e:
+        st.error(f"Failed to read PDF: {e}")
+        return ""
 
+@st.cache_data
 def chunk_text(text):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     return splitter.split_text(text)
 
-def create_faiss_index(chunks):
-    embeddings = embedding_model.encode(chunks)
+def get_file_hash(file_data):
+    return hashlib.md5(file_data).hexdigest()
+
+@st.cache_resource
+def create_faiss_index_cached(chunks, file_hash):
+    embeddings = embedding_model.encode(chunks, show_progress_bar=True, convert_to_numpy=True)
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(np.array(embeddings))
     return index, chunks
@@ -148,15 +165,20 @@ def document_qa():
     st.title("📄 Document QA using RAG")
     uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
     if uploaded_pdf:
+        file_bytes = uploaded_pdf.read()
+        file_hash = get_file_hash(file_bytes)
+        uploaded_pdf.seek(0)
         text = extract_text_from_pdf(uploaded_pdf)
-        chunks = chunk_text(text)
-        index, stored_chunks = create_faiss_index(chunks)
-        st.success("PDF indexed. You can now ask questions.")
-        query = st.text_input("Enter your question:")
-        if query:
-            answer = answer_question(query, index, stored_chunks)
-            st.subheader("Answer:")
-            st.write(answer)
+        if text:
+            with st.spinner("Indexing your document..."):
+                chunks = chunk_text(text)
+                index, stored_chunks = create_faiss_index_cached(chunks, file_hash)
+            st.success("PDF indexed. You can now ask questions.")
+            query = st.text_input("Enter your question:")
+            if query:
+                answer = answer_question(query, index, stored_chunks)
+                st.subheader("Answer:")
+                st.write(answer)
 
 # --- Main Menu ---
 def main_menu():
@@ -176,4 +198,5 @@ def main_menu():
             register_page()
 
 # --- Run App ---
-main_menu()
+if __name__ == "__main__":
+    main_menu()
